@@ -44,7 +44,7 @@ import ollama
 import argparse
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, ExitStack
 import json
 from urllib.parse import unquote as _url_unquote
 from typing import Optional, List, Dict, Any, Tuple
@@ -278,6 +278,80 @@ def _process_elements_batch(batch: List[Tuple[str, Dict[str, str], List[Tuple[st
                         row[f"metadata:{k}"] = v
             result[tag]['rows'].append(row)
             result[tag]['cols'].update(row.keys())
+        except Exception:
+            result[tag]['bad'] += 1
+
+    return result
+
+
+class _JsonArrayWriter:
+    """Stream JSON array items to disk without holding them all in memory."""
+
+    def __init__(self, path: str, indent: int = 2):
+        self.path = path
+        self.indent = indent
+        self._file = None
+        self._first = True
+
+    def __enter__(self):
+        os.makedirs(os.path.dirname(self.path) or '.', exist_ok=True)
+        self._file = open(self.path, 'w', encoding='utf-8')
+        self._file.write('[')
+        return self
+
+    def write_many(self, items: List[Dict[str, Any]]):
+        if not self._file or not items:
+            return
+        for obj in items:
+            if self._first:
+                self._file.write('\n')
+                self._first = False
+            else:
+                self._file.write(',\n')
+            if self.indent:
+                self._file.write(' ' * self.indent)
+            json.dump(obj, self._file, ensure_ascii=False)
+
+    def close(self):
+        if not self._file:
+            return
+        if self._first:
+            self._file.write(']')
+        else:
+            self._file.write('\n]')
+        try:
+            self._file.flush()
+        finally:
+            self._file.close()
+            self._file = None
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
+
+def _process_json_elements_batch(batch: List[Tuple[str, Dict[str, str], List[Tuple[str, str]]]]):
+    """Convert a batch of serialized XML elements into JSON-ready row dicts."""
+    result = {
+        'Record': {'rows': [], 'bad': 0},
+        'Workout': {'rows': [], 'bad': 0},
+        'ActivitySummary': {'rows': [], 'bad': 0},
+    }
+
+    for tag, attrib, metadata in batch:
+        if tag not in result:
+            continue
+        try:
+            if tag in {'Record', 'Workout'}:
+                row = dict(attrib)
+                md = {}
+                for k, v in metadata:
+                    if k is not None:
+                        md[k] = v
+                if md:
+                    row['metadata'] = md
+                result[tag]['rows'].append(row)
+            elif tag == 'ActivitySummary':
+                result[tag]['rows'].append(dict(attrib))
         except Exception:
             result[tag]['bad'] += 1
 
@@ -2899,7 +2973,11 @@ def convert_xml_to_csv(
     if records_path:
         print_open_hint(records_path)
 
-def convert_xml_to_json():
+def convert_xml_to_json(
+    worker_count: Optional[int] = None,
+    batch_size: Optional[int] = None,
+    use_multiprocessing: bool = True,
+):
     """Convert Apple Health export.xml into JSON files.
 
     Creates three JSON files under the output directory:
@@ -2910,76 +2988,132 @@ def convert_xml_to_json():
     Notes:
     - Metadata entries are grouped under a 'metadata' object where keys are the
       MetadataEntry 'key' values and values are the corresponding 'value'.
-    - This complements the CSV exporter with a more structured JSON format.
+    - Streaming parser and optional multiprocessing keep memory usage low by
+      processing batches and writing JSON incrementally.
     """
     export_path = resolve_export_xml()
     print(f"Using export file: {export_path}")
 
-    def _metadata_obj(elem):
-        md = {}
-        try:
-            for m in elem.findall('.//MetadataEntry'):
-                k = m.get('key')
-                v = m.get('value')
-                if k is not None:
-                    md[k] = v
-        except Exception:
-            pass
-        return md or None
+    resolved_workers, resolved_batch = _resolve_worker_settings(worker_count, batch_size)
+    use_pool = use_multiprocessing and not _cli_disable_multiprocessing and resolved_workers > 1
 
-    records: List[Dict[str, Any]] = []
-    workouts: List[Dict[str, Any]] = []
-    summaries: List[Dict[str, Any]] = []
-
-    with spinner("Streaming export.xml"):
-        context = ET.iterparse(export_path, events=("start", "end"))
-        _, root = next(context)
-        for event, elem in context:
-            if event != 'end':
-                continue
-            tag = _strip_tag(elem.tag)
-            try:
-                if tag == 'Record':
-                    row = dict(elem.attrib)
-                    md = _metadata_obj(elem)
-                    if md is not None:
-                        row['metadata'] = md
-                    records.append(row)
-                elif tag == 'Workout':
-                    row = dict(elem.attrib)
-                    md = _metadata_obj(elem)
-                    if md is not None:
-                        row['metadata'] = md
-                    workouts.append(row)
-                elif tag == 'ActivitySummary':
-                    summaries.append(dict(elem.attrib))
-            except Exception:
-                pass
-            finally:
-                elem.clear()
+    counts = {'Record': 0, 'Workout': 0, 'ActivitySummary': 0}
+    bad_counts = {'Record': 0, 'Workout': 0, 'ActivitySummary': 0}
+    target_tags = set(counts.keys())
 
     out_dir = get_output_dir()
     os.makedirs(out_dir, exist_ok=True)
+    paths = {
+        'Record': os.path.join(out_dir, 'records.json'),
+        'Workout': os.path.join(out_dir, 'workouts.json'),
+        'ActivitySummary': os.path.join(out_dir, 'activity_summary.json'),
+    }
 
-    def _write_json(obj, filename):
-        path = os.path.join(out_dir, filename)
+    executor = None
+    pending = []
+    max_pending = max(1, resolved_workers * 2)
+    report_interval = 50000
+    next_report = report_interval
+    writer_map: Dict[str, _JsonArrayWriter] = {}
+
+    def _handle_result(result):
+        nonlocal next_report
+        for tag, bucket in result.items():
+            if tag not in writer_map:
+                continue
+            rows = bucket.get('rows', [])
+            if rows:
+                writer_map[tag].write_many(rows)
+                counts[tag] += len(rows)
+            bad_counts[tag] += bucket.get('bad', 0)
+        total = sum(counts.values())
+        if total >= next_report:
+            _status(
+                f"Processed {total} elements "
+                f"(Records: {counts['Record']}, Workouts: {counts['Workout']}, ActivitySummary: {counts['ActivitySummary']})"
+            )
+            next_report += report_interval
+
+    def _drain_pending(force: bool = False):
+        nonlocal pending
+        while pending and (force or len(pending) >= max_pending):
+            wait_mode = concurrent.futures.ALL_COMPLETED if force else concurrent.futures.FIRST_COMPLETED
+            done, not_done = concurrent.futures.wait(pending, return_when=wait_mode)
+            pending = list(not_done)
+            for fut in done:
+                try:
+                    _handle_result(fut.result())
+                except Exception as e:
+                    _status(f"Worker error: {e}")
+
+    def _submit_batch(batch_payload):
+        if not batch_payload:
+            return
+        if executor:
+            pending.append(executor.submit(_process_json_elements_batch, batch_payload))
+            _drain_pending()
+        else:
+            _handle_result(_process_json_elements_batch(batch_payload))
+
+    batch_payload: List[Tuple[str, Dict[str, str], List[Tuple[str, str]]]] = []
+
+    _status(
+        f"Streaming export.xml to JSON with batch size {resolved_batch} and "
+        f"{'multiprocessing' if use_pool else 'single-threaded'} mode ({resolved_workers} worker(s))"
+    )
+
+    with ExitStack() as stack:
+        writer_map = {
+            'Record': stack.enter_context(_JsonArrayWriter(paths['Record'])),
+            'Workout': stack.enter_context(_JsonArrayWriter(paths['Workout'])),
+            'ActivitySummary': stack.enter_context(_JsonArrayWriter(paths['ActivitySummary'])),
+        }
+
+        if use_pool:
+            try:
+                executor = concurrent.futures.ProcessPoolExecutor(max_workers=resolved_workers)
+            except Exception as pool_err:
+                _status(f"Multiprocessing unavailable ({pool_err}); falling back to single-threaded mode.")
+                executor = None
+
         try:
-            with open(path, 'w', encoding='utf-8') as f:
-                json.dump(obj, f, ensure_ascii=False, indent=2)
-            return path
-        except Exception as e:
-            print(f"Failed to write {filename}: {e}")
-            return None
+            with spinner("Parsing export.xml"):
+                context = ET.iterparse(export_path, events=("start", "end"))
+                _, root = next(context)
+                for event, elem in context:
+                    if event != 'end':
+                        continue
+                    tag = _strip_tag(elem.tag)
+                    if tag not in target_tags:
+                        elem.clear()
+                        continue
+                    batch_payload.append(_serialize_element_for_worker(elem))
+                    elem.clear()
+                    if len(batch_payload) >= resolved_batch:
+                        _submit_batch(batch_payload)
+                        batch_payload = []
+                if batch_payload:
+                    _submit_batch(batch_payload)
+            if executor:
+                _drain_pending(force=True)
+        finally:
+            if executor:
+                executor.shutdown(wait=True)
 
-    print("Writing JSON files…")
-    rec_path = _write_json(records, 'records.json')
-    w_path = _write_json(workouts, 'workouts.json')
-    as_path = _write_json(summaries, 'activity_summary.json')
+    rec_path = paths['Record']
+    w_path = paths['Workout']
+    as_path = paths['ActivitySummary']
 
     print("\nXML→JSON conversion complete:")
-    print(f"- Records: {len(records)}")
-    print(f"- Workouts: {len(workouts)}")
-    print(f"- Activity Summaries: {len(summaries)}")
+    records_msg = f"- Records: {counts['Record']}"
+    if bad_counts['Record']:
+        records_msg += f" (skipped {bad_counts['Record']} malformed)"
+    workouts_msg = f"- Workouts: {counts['Workout']}"
+    if bad_counts['Workout']:
+        workouts_msg += f" (skipped {bad_counts['Workout']} malformed)"
+    print(records_msg)
+    print(workouts_msg)
+    print(f"- Activity Summaries: {counts['ActivitySummary']}")
     if rec_path:
         print(f"Saved: {rec_path}")
         print_open_hint(rec_path)

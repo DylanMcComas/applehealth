@@ -23,6 +23,7 @@ A Python tool that transforms Apple Health export data into insightful visualiza
 - 📄 XML → JSON Export (Full Dump) — export Records, Workouts, and ActivitySummary to JSON
 - 🧪 LM Studio Support — Use LM Studio's OpenAI-compatible local server for AI analysis
 - 🟩 Jan & LocalAI Support — Use Jan (getjan.ai) and LocalAI via OpenAI-compatible APIs
+- ⚡ Streaming XML export with configurable worker/batch sizing for large exports
 
 ## 📺 Youtube tutorial
 
@@ -42,6 +43,7 @@ cd applehealth
 
 # Optional: pass paths explicitly
 # ./run --export "/absolute/path/to/export.xml" --out "./health_out"
+# ./run --export "/absolute/path/to/export.xml" --out "./health_out" --workers 4 --batch-size 8000
 
 # Or use Make (macOS/Linux)
 make run                       # prompts for export.xml
@@ -220,6 +222,7 @@ Notes:
 - If you omit `--export`, the app will prompt you for the path (you can drag-and-drop the file or folder).
 - By default, outputs are saved to `./health_out`.
 - `--out` lets you choose a different output folder.
+- Performance tuning for XML → CSV/JSON exports (menu options 7/8): `--workers N` sets the process pool size (default: CPU cores), `--batch-size N` controls streaming chunk size (default: 10000), and `--no-multiprocessing` forces single-process mode if you hit platform limits.
 
 ## 🐳 Docker Usage
 
