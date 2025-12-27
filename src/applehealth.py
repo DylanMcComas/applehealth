@@ -30,6 +30,8 @@ Version: 1.4.1
 """
 
 import xml.etree.ElementTree as ET
+import concurrent.futures
+import tempfile
 from datetime import datetime
 from pandas import DataFrame, read_csv
 from pandas.core.groupby import DataFrameGroupBy
@@ -59,7 +61,10 @@ except Exception:
 # Optional user-provided path to export.xml (from CLI or prompt)
 _export_xml_path = None
 _output_dir = os.environ.get('OUTPUT_DIR')
-__version__ = "1.4.2"
+_cli_worker_count: Optional[int] = None
+_cli_batch_size: Optional[int] = None
+_cli_disable_multiprocessing: bool = False
+__version__ = "1.4.3"
 
 def get_output_dir():
     """Return the absolute output directory, creating it if needed.
@@ -221,6 +226,79 @@ def _status(msg: str):
         print(f"[{ts}] {msg}")
     except Exception:
         print(msg)
+
+
+def _strip_tag(tag: str) -> str:
+    """Return the tag name without any XML namespace."""
+    try:
+        if '}' in tag:
+            return tag.split('}', 1)[1]
+    except Exception:
+        pass
+    return tag
+
+
+def _serialize_element_for_worker(elem):
+    """Serialize an Element into a lightweight payload for worker processing."""
+    tag = _strip_tag(elem.tag)
+    attrib = dict(elem.attrib)
+    metadata_entries = []
+    if tag in {'Record', 'Workout'}:
+        try:
+            for m in elem.findall('.//MetadataEntry'):
+                k = m.get('key')
+                v = m.get('value')
+                if k is not None:
+                    metadata_entries.append((k, v))
+        except Exception:
+            pass
+    return tag, attrib, metadata_entries
+
+
+def _process_elements_batch(batch: List[Tuple[str, Dict[str, str], List[Tuple[str, str]]]]):
+    """Flatten a batch of serialized XML elements into row dicts.
+
+    Returns a mapping keyed by element tag with rows, column sets, and a count
+    of malformed elements skipped.
+    """
+    result = {
+        'Record': {'rows': [], 'cols': set(), 'bad': 0},
+        'Workout': {'rows': [], 'cols': set(), 'bad': 0},
+        'ActivitySummary': {'rows': [], 'cols': set(), 'bad': 0},
+    }
+
+    for tag, attrib, metadata in batch:
+        if tag not in result:
+            continue
+        try:
+            row = dict(attrib)
+            if tag in {'Record', 'Workout'}:
+                for k, v in metadata:
+                    if k:
+                        row[f"metadata:{k}"] = v
+            result[tag]['rows'].append(row)
+            result[tag]['cols'].update(row.keys())
+        except Exception:
+            result[tag]['bad'] += 1
+
+    return result
+
+
+def _resolve_worker_settings(worker_count: Optional[int], batch_size: Optional[int]) -> Tuple[int, int]:
+    """Resolve worker and batch sizes using CLI overrides and defaults."""
+    resolved_workers = (
+        worker_count
+        if worker_count is not None
+        else _cli_worker_count
+    )
+    if not resolved_workers or resolved_workers < 1:
+        resolved_workers = os.cpu_count() or 1
+
+    resolved_batch = batch_size if batch_size is not None else _cli_batch_size
+    if not resolved_batch or resolved_batch < 1:
+        resolved_batch = 10000
+
+    return resolved_workers, resolved_batch
 
 # --- Ollama helpers ---
 def _extract_ollama_chunk_text(chunk: Any) -> str:
@@ -2604,7 +2682,11 @@ def analyze_with_localai(csv_files):
         save_prefix='localai'
     )
 
-def convert_xml_to_csv():
+def convert_xml_to_csv(
+    worker_count: Optional[int] = None,
+    batch_size: Optional[int] = None,
+    use_multiprocessing: bool = True,
+):
     """Convert Apple Health export.xml into comprehensive CSV files.
 
     Creates three CSVs under the output directory:
@@ -2614,112 +2696,199 @@ def convert_xml_to_csv():
 
     Notes:
     - Metadata entries are flattened as columns named 'metadata:<key>'.
-    - Missing columns are left blank for rows that don't have them.
-    - This aims to mirror the simple structure of common XML→CSV tools.
+    - Streaming parser and batch processing keep memory usage low and parallelize
+      flattening when multiprocessing is available.
     """
     export_path = resolve_export_xml()
     print(f"Using export file: {export_path}")
 
-    with spinner("Parsing export.xml"):
-        tree = ET.parse(export_path)
-        root = tree.getroot()
-
-    # Helper to extract metadata entries as flat dict
-    def _metadata_dict(elem):
-        out = {}
-        try:
-            for m in elem.findall('.//MetadataEntry'):
-                k = m.get('key')
-                v = m.get('value')
-                if k:
-                    out[f"metadata:{k}"] = v
-        except Exception:
-            pass
-        return out
-
-    # Collect Records
-    print("Scanning <Record> elements…")
-    record_rows = []
-    record_cols = set()
-    bad_records = 0
-    for rec in root.findall('.//Record'):
-        try:
-            row = dict(rec.attrib)
-            row.update(_metadata_dict(rec))
-            record_rows.append(row)
-            record_cols.update(row.keys())
-        except Exception:
-            bad_records += 1
-            continue
-
-    # Collect Workouts
-    print("Scanning <Workout> elements…")
-    workout_rows = []
-    workout_cols = set()
-    bad_workouts = 0
-    for w in root.findall('.//Workout'):
-        try:
-            row = dict(w.attrib)
-            row.update(_metadata_dict(w))
-            workout_rows.append(row)
-            workout_cols.update(row.keys())
-        except Exception:
-            bad_workouts += 1
-            continue
-
-    # Collect ActivitySummary
-    print("Scanning <ActivitySummary> elements…")
-    as_rows = []
-    as_cols = set()
-    for a in root.findall('.//ActivitySummary'):
-        try:
-            row = dict(a.attrib)
-            as_rows.append(row)
-            as_cols.update(row.keys())
-        except Exception:
-            continue
+    resolved_workers, resolved_batch = _resolve_worker_settings(worker_count, batch_size)
+    use_pool = use_multiprocessing and not _cli_disable_multiprocessing and resolved_workers > 1
 
     out_dir = get_output_dir()
     os.makedirs(out_dir, exist_ok=True)
 
-    # Write CSVs using pandas for convenience
-    def _write_csv(rows, cols, filename):
-        if not rows:
-            # Create empty with header if possible
-            try:
-                from pandas import DataFrame
-                DataFrame(columns=sorted(list(cols))).to_csv(os.path.join(out_dir, filename), index=False)
-            except Exception:
-                pass
-            return None
+    preferred_cols = [
+        'type', 'unit', 'value', 'sourceName', 'sourceVersion', 'device',
+        'creationDate', 'startDate', 'endDate', 'workoutActivityType',
+        'duration', 'durationUnit', 'totalDistance', 'totalDistanceUnit',
+        'totalEnergyBurned', 'totalEnergyBurnedUnit', 'dateComponents'
+    ]
+
+    temp_files = {
+        'Record': tempfile.NamedTemporaryFile('w+', delete=False, suffix='_records.jsonl', encoding='utf-8'),
+        'Workout': tempfile.NamedTemporaryFile('w+', delete=False, suffix='_workouts.jsonl', encoding='utf-8'),
+        'ActivitySummary': tempfile.NamedTemporaryFile('w+', delete=False, suffix='_activity.jsonl', encoding='utf-8'),
+    }
+    counts = {k: 0 for k in temp_files.keys()}
+    bad_counts = {k: 0 for k in temp_files.keys()}
+    columns = {k: set() for k in temp_files.keys()}
+
+    pending = []
+    executor = None
+    if use_pool:
         try:
-            from pandas import DataFrame
-            # Ensure consistent column order: common useful keys first
-            preferred = [
-                'type', 'unit', 'value', 'sourceName', 'sourceVersion', 'device',
-                'creationDate', 'startDate', 'endDate', 'workoutActivityType',
-                'duration', 'durationUnit', 'totalDistance', 'totalDistanceUnit',
-                'totalEnergyBurned', 'totalEnergyBurnedUnit', 'dateComponents'
-            ]
-            remaining = [c for c in sorted(list(cols)) if c not in preferred]
-            ordered = [c for c in preferred if c in cols] + remaining
-            df = DataFrame(rows, columns=ordered)
-            path = os.path.join(out_dir, filename)
-            df.to_csv(path, index=False)
-            return path
-        except Exception as e:
-            print(f"Failed to write {filename}: {e}")
-            return None
+            executor = concurrent.futures.ProcessPoolExecutor(max_workers=resolved_workers)
+        except Exception as pool_err:
+            _status(f"Multiprocessing unavailable ({pool_err}); falling back to single-threaded mode.")
+            executor = None
+
+    max_pending = max(resolved_workers * 2, 1)
+    last_status = time.time()
+
+    def _report(force: bool = False):
+        nonlocal last_status
+        now = time.time()
+        if force or (now - last_status) >= 2:
+            _status(
+                f"Processed {counts['Record']} records, {counts['Workout']} workouts, "
+                f"{counts['ActivitySummary']} activity summaries"
+            )
+            last_status = now
+
+    def _handle_result(res):
+        if not res:
+            return
+        for tag, payload in res.items():
+            bad_counts[tag] += payload.get('bad', 0)
+            rows = payload.get('rows', []) or []
+            if not rows:
+                continue
+            columns[tag].update(payload.get('cols', set()))
+            counts[tag] += len(rows)
+            for row in rows:
+                try:
+                    temp_files[tag].write(json.dumps(row))
+                    temp_files[tag].write('\n')
+                except Exception:
+                    bad_counts[tag] += 1
+        _report()
+
+    def _drain_pending(force: bool = False):
+        nonlocal pending
+        if not executor:
+            return
+        if force:
+            done = list(concurrent.futures.as_completed(pending))
+            pending = []
+            for fut in done:
+                try:
+                    _handle_result(fut.result())
+                except Exception as e:
+                    _status(f"Worker error: {e}")
+            return
+        if len(pending) >= max_pending:
+            done, not_done = concurrent.futures.wait(pending, return_when=concurrent.futures.FIRST_COMPLETED)
+            pending = list(not_done)
+            for fut in done:
+                try:
+                    _handle_result(fut.result())
+                except Exception as e:
+                    _status(f"Worker error: {e}")
+
+    def _submit_batch(batch_payload):
+        if not batch_payload:
+            return
+        if executor:
+            pending.append(executor.submit(_process_elements_batch, batch_payload))
+            _drain_pending()
+        else:
+            _handle_result(_process_elements_batch(batch_payload))
+
+    batch_payload: List[Tuple[str, Dict[str, str], List[Tuple[str, str]]]] = []
+    target_tags = {'Record', 'Workout', 'ActivitySummary'}
+
+    _status(
+        f"Streaming export.xml with batch size {resolved_batch} and "
+        f"{'multiprocessing' if executor else 'single-threaded'} mode ({resolved_workers} worker(s))"
+    )
+    try:
+        with spinner("Parsing export.xml"):
+            context = ET.iterparse(export_path, events=("start", "end"))
+            _, root = next(context)
+            for event, elem in context:
+                if event != 'end':
+                    continue
+                tag = _strip_tag(elem.tag)
+                if tag not in target_tags:
+                    elem.clear()
+                    continue
+                batch_payload.append(_serialize_element_for_worker(elem))
+                elem.clear()
+                if len(batch_payload) >= resolved_batch:
+                    _submit_batch(batch_payload)
+                    batch_payload = []
+            if batch_payload:
+                _submit_batch(batch_payload)
+        if executor:
+            _drain_pending(force=True)
+    finally:
+        if executor:
+            executor.shutdown(wait=True)
+        for f in temp_files.values():
+            try:
+                f.flush()
+            finally:
+                f.close()
+
+    _report(force=True)
+
+    def _write_csv_from_temp(temp_path: str, cols: set, filename: str):
+        ordered_cols = [c for c in preferred_cols if c in cols] + [c for c in sorted(cols) if c not in preferred_cols]
+        if not ordered_cols:
+            ordered_cols = sorted(list(cols))
+
+        output_path = os.path.join(out_dir, filename)
+        if not os.path.exists(temp_path) or os.path.getsize(temp_path) == 0:
+            try:
+                DataFrame(columns=ordered_cols).to_csv(output_path, index=False)
+                return output_path
+            except Exception:
+                return None
+
+        header_written = False
+        chunk_rows: List[Dict[str, Any]] = []
+        chunk_size = 5000
+
+        with open(temp_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                try:
+                    chunk_rows.append(json.loads(line))
+                except Exception:
+                    continue
+                if len(chunk_rows) >= chunk_size:
+                    df = DataFrame(chunk_rows).reindex(columns=ordered_cols)
+                    df.to_csv(output_path, index=False, mode='a', header=not header_written)
+                    header_written = True
+                    chunk_rows.clear()
+
+        if chunk_rows:
+            df = DataFrame(chunk_rows).reindex(columns=ordered_cols)
+            df.to_csv(output_path, index=False, mode='a', header=not header_written)
+
+        return output_path
 
     print("Writing CSV files…")
-    records_path = _write_csv(record_rows, record_cols, 'records.csv')
-    workouts_path = _write_csv(workout_rows, workout_cols, 'workouts.csv')
-    activity_path = _write_csv(as_rows, as_cols, 'activity_summary.csv')
+    records_path = _write_csv_from_temp(temp_files['Record'].name, columns['Record'], 'records.csv')
+    workouts_path = _write_csv_from_temp(temp_files['Workout'].name, columns['Workout'], 'workouts.csv')
+    activity_path = _write_csv_from_temp(temp_files['ActivitySummary'].name, columns['ActivitySummary'], 'activity_summary.csv')
+
+    for temp in temp_files.values():
+        try:
+            os.remove(temp.name)
+        except Exception:
+            pass
 
     print("\nXML→CSV conversion complete:")
-    print(f"- Records: {len(record_rows)} rows{f' (skipped {bad_records} malformed)' if bad_records else ''}")
-    print(f"- Workouts: {len(workout_rows)} rows{f' (skipped {bad_workouts} malformed)' if bad_workouts else ''}")
-    print(f"- Activity Summaries: {len(as_rows)} rows")
+    records_msg = f"- Records: {counts['Record']} rows"
+    if bad_counts['Record']:
+        records_msg += f" (skipped {bad_counts['Record']} malformed)"
+    workouts_msg = f"- Workouts: {counts['Workout']} rows"
+    if bad_counts['Workout']:
+        workouts_msg += f" (skipped {bad_counts['Workout']} malformed)"
+    print(records_msg)
+    print(workouts_msg)
+    print(f"- Activity Summaries: {counts['ActivitySummary']} rows")
     if records_path:
         print(f"Saved: {records_path}")
     if workouts_path:
@@ -2746,10 +2915,6 @@ def convert_xml_to_json():
     export_path = resolve_export_xml()
     print(f"Using export file: {export_path}")
 
-    with spinner("Parsing export.xml"):
-        tree = ET.parse(export_path)
-        root = tree.getroot()
-
     def _metadata_obj(elem):
         md = {}
         try:
@@ -2762,40 +2927,36 @@ def convert_xml_to_json():
             pass
         return md or None
 
-    # Records
-    print("Scanning <Record> elements…")
-    records = []
-    for rec in root.findall('.//Record'):
-        try:
-            row = dict(rec.attrib)
-            md = _metadata_obj(rec)
-            if md is not None:
-                row['metadata'] = md
-            records.append(row)
-        except Exception:
-            continue
+    records: List[Dict[str, Any]] = []
+    workouts: List[Dict[str, Any]] = []
+    summaries: List[Dict[str, Any]] = []
 
-    # Workouts
-    print("Scanning <Workout> elements…")
-    workouts = []
-    for w in root.findall('.//Workout'):
-        try:
-            row = dict(w.attrib)
-            md = _metadata_obj(w)
-            if md is not None:
-                row['metadata'] = md
-            workouts.append(row)
-        except Exception:
-            continue
-
-    # ActivitySummary
-    print("Scanning <ActivitySummary> elements…")
-    summaries = []
-    for a in root.findall('.//ActivitySummary'):
-        try:
-            summaries.append(dict(a.attrib))
-        except Exception:
-            continue
+    with spinner("Streaming export.xml"):
+        context = ET.iterparse(export_path, events=("start", "end"))
+        _, root = next(context)
+        for event, elem in context:
+            if event != 'end':
+                continue
+            tag = _strip_tag(elem.tag)
+            try:
+                if tag == 'Record':
+                    row = dict(elem.attrib)
+                    md = _metadata_obj(elem)
+                    if md is not None:
+                        row['metadata'] = md
+                    records.append(row)
+                elif tag == 'Workout':
+                    row = dict(elem.attrib)
+                    md = _metadata_obj(elem)
+                    if md is not None:
+                        row['metadata'] = md
+                    workouts.append(row)
+                elif tag == 'ActivitySummary':
+                    summaries.append(dict(elem.attrib))
+            except Exception:
+                pass
+            finally:
+                elem.clear()
 
     out_dir = get_output_dir()
     os.makedirs(out_dir, exist_ok=True)
@@ -2971,6 +3132,9 @@ if __name__ == "__main__":
         parser = argparse.ArgumentParser(description="Apple Health Data Analyzer")
         parser.add_argument('-e', '--export', help='Path to export.xml or a directory containing it')
         parser.add_argument('-o', '--out', help='Directory to write CSV/PNG/MD outputs (default: current directory or OUTPUT_DIR env)')
+        parser.add_argument('--workers', type=int, help='Number of workers for parallel XML parsing (default: CPU count)')
+        parser.add_argument('--batch-size', type=int, help='Number of XML elements per processing batch (default: 10000)')
+        parser.add_argument('--no-multiprocessing', action='store_true', help='Force single-threaded CSV conversion')
         parser.add_argument('path', nargs='?', help='Optional positional path to export.xml or containing directory')
         args = parser.parse_args()
         chosen = args.export or args.path
@@ -2986,6 +3150,12 @@ if __name__ == "__main__":
                 _set_saved_pref('output_dir', _output_dir)
             except Exception:
                 pass
+        if args.workers is not None:
+            _cli_worker_count = args.workers
+        if args.batch_size is not None:
+            _cli_batch_size = args.batch_size
+        if args.no_multiprocessing:
+            _cli_disable_multiprocessing = True
     except SystemExit:
         raise
 

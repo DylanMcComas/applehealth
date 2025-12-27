@@ -1,0 +1,10 @@
+<HealthData locale="en_US">
+  <Record type="HKQuantityTypeIdentifierStepCount" unit="count" value="123" sourceName="Phone" creationDate="2024-10-10 10:00:00 +0000" startDate="2024-10-10 09:59:00 +0000" endDate="2024-10-10 10:00:00 +0000">
+    <MetadataEntry key="HKWasUserEntered" value="1" />
+  </Record>
+  <Record type="HKQuantityTypeIdentifierHeartRate" unit="count/min" value="60" sourceName="Watch" creationDate="2024-10-10 10:01:00 +0000" startDate="2024-10-10 10:01:00 +0000" endDate="2024-10-10 10:01:30 +0000" />
+  <Workout workoutActivityType="HKWorkoutActivityTypeRunning" duration="600" durationUnit="sec" totalDistance="2.0" totalDistanceUnit="km" totalEnergyBurned="100" totalEnergyBurnedUnit="kcal" sourceName="Watch" startDate="2024-10-10 09:30:00 +0000" endDate="2024-10-10 09:40:00 +0000">
+    <MetadataEntry key="Weather" value="Sunny" />
+  </Workout>
+  <ActivitySummary dateComponents="2024-10-10" activeEnergyBurned="400" activeEnergyBurnedUnit="kcal" appleMoveTime="50" appleExerciseTime="20" />
+</HealthData>
