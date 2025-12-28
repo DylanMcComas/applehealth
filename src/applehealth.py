@@ -51,6 +51,7 @@ from urllib.parse import unquote as _url_unquote
 from typing import Optional, List, Dict, Any, Tuple
 import re
 from collections import defaultdict
+from textwrap import dedent
 try:
     import anthropic  # Claude SDK
 except Exception:
@@ -1171,7 +1172,8 @@ def analyze_sleep():
             try:
                 start_date_str = record.get('startDate')
                 end_date_str = record.get('endDate')
-                sleep_value = record.get('value')
+                sleep_value_raw = record.get('value')
+                sleep_value = '' if sleep_value_raw is None else str(sleep_value_raw)
                 source_name = record.get('sourceName', 'Unknown')
                 
                 if not start_date_str or not end_date_str or not sleep_value:
@@ -1467,6 +1469,16 @@ def _legacy_generate_missing_analysis_files(missing_files: List[Tuple[str, str]]
     if not missing_files:
         return True
 
+    normalized: List[Tuple[str, str]] = []
+    for item in missing_files:
+        if isinstance(item, tuple) and len(item) >= 1:
+            # Ensure two elements for unpacking later
+            name = item[0]
+            label = item[1] if len(item) > 1 else ''
+            normalized.append((name, label))
+        else:
+            normalized.append((str(item), ''))
+
     print("Falling back to per-metric analyzers to generate missing CSVs...")
     original_show = plt.show
     plt.show = lambda: None
@@ -1481,7 +1493,7 @@ def _legacy_generate_missing_analysis_files(missing_files: List[Tuple[str, str]]
             'workout_data.csv': analyze_workouts,
         }
 
-        for file_name, data_type in missing_files:
+        for file_name, data_type in normalized:
             func = analysis_functions.get(file_name)
             if not func:
                 continue
@@ -1751,31 +1763,25 @@ def _generate_workout_csv_from_export(workouts_path: str):
 
 
 def _generate_ai_data(csv_files: List[Tuple[str, str]]) -> bool:
-    """Ensure AI options have needed CSVs using the streaming converter + cached exports.
-
-    For AI runs we always write into a fresh timestamped output folder to avoid
-    overwriting prior exports and to keep runs isolated.
-    """
+    """Ensure AI options have needed CSVs using the streaming converter + cached exports."""
     base_out = get_output_dir()
-    run_dir = os.path.join(base_out, datetime.now().strftime("run_%Y%m%d_%H%M%S"))
-    os.makedirs(run_dir, exist_ok=True)
-
-    # Point downstream helpers to the new run directory
     global _output_dir
-    _output_dir = run_dir
-    try:
-        _set_saved_pref('output_dir', run_dir)
-    except Exception:
-        pass
+    _output_dir = base_out
 
-    print(f"\nGenerating fresh exports for AI analysis in: {run_dir}")
-    print("This uses the chunked, parallel XML converter (same as options 7/8) and keeps previous runs untouched.")
+    print(f"\nPreparing data for AI analysis in: {base_out}")
+    print("Caching is respected: if export.xml and outputs are unchanged, existing CSVs are reused.")
 
+    # Determine which per-metric CSVs are missing/empty so we don't rebuild unnecessarily
+    missing_targets = {
+        name
+        for name, _ in csv_files
+        if not os.path.exists(os.path.join(base_out, name)) or os.path.getsize(os.path.join(base_out, name)) == 0
+    }
     try:
-        convert_xml_to_csv(out_dir_override=run_dir)
+        convert_xml_to_csv(out_dir_override=base_out)
     except Exception as e:
         _status(f"Optimized XML → CSV export failed ({e}); trying legacy analyzers.")
-        return _legacy_generate_missing_analysis_files(csv_files)
+        return _legacy_generate_missing_analysis_files(list(missing_targets))
 
     needed_names = {name for name, _ in csv_files}
     records_needed = {
@@ -1788,16 +1794,17 @@ def _generate_ai_data(csv_files: List[Tuple[str, str]]) -> bool:
     workouts_needed = 'workout_data.csv' in needed_names
 
     ok = True
-    records_path = os.path.join(run_dir, 'records.csv')
-    if records_needed & needed_names:
+    records_path = os.path.join(base_out, 'records.csv')
+    metrics_to_build = (records_needed & needed_names) & missing_targets
+    if metrics_to_build:
         if os.path.exists(records_path):
-            _generate_metric_csvs_from_records(records_path, records_needed & needed_names)
+            _generate_metric_csvs_from_records(records_path, metrics_to_build)
         else:
             _status("records.csv missing after conversion; skipping optimized metric builds.")
             ok = False
 
-    if workouts_needed:
-        workouts_path = os.path.join(run_dir, 'workouts.csv')
+    if workouts_needed and 'workout_data.csv' in missing_targets:
+        workouts_path = os.path.join(base_out, 'workouts.csv')
         if os.path.exists(workouts_path):
             _generate_workout_csv_from_export(workouts_path)
         else:
@@ -1807,7 +1814,7 @@ def _generate_ai_data(csv_files: List[Tuple[str, str]]) -> bool:
     # Verify generation; fallback to legacy if anything is still missing
     remaining = []
     for name, dt in csv_files:
-        path = os.path.join(run_dir, name)
+        path = os.path.join(base_out, name)
         if not os.path.exists(path) or os.path.getsize(path) == 0:
             remaining.append((name, dt))
     if remaining:
@@ -3587,7 +3594,24 @@ def check_env():
 if __name__ == "__main__":
     # Parse optional CLI args for export path and output directory
     try:
-        parser = argparse.ArgumentParser(description="Apple Health Data Analyzer")
+        help_epilog = dedent("""
+            Examples:
+              python src/applehealth.py --export "/path/to/export.xml" --out "./health_out"
+              python src/applehealth.py --export "/path/to/export.xml" --out "./health_out" --workers 4 --batch-size 8000
+              python src/applehealth.py /path/to/export.xml
+              ./run --export "/path/to/export.xml" --out "./health_out"
+
+            Notes:
+              - Use --workers/--batch-size to tune XML → CSV/JSON performance (menu options 7/8 and AI options 9–18).
+              - --no-multiprocessing forces single-process parsing if your platform has issues with pools.
+              - --force-rescan skips the cache and rebuilds CSV/JSON even if export.xml is unchanged.
+              - Positional PATH can be the export.xml file or a directory containing it.
+            """)
+        parser = argparse.ArgumentParser(
+            description="Apple Health Data Analyzer (interactive menu)",
+            formatter_class=argparse.RawDescriptionHelpFormatter,
+            epilog=help_epilog,
+        )
         parser.add_argument('-e', '--export', help='Path to export.xml or a directory containing it')
         parser.add_argument('-o', '--out', help='Directory to write CSV/PNG/MD outputs (default: current directory or OUTPUT_DIR env)')
         parser.add_argument('--workers', type=int, help='Number of workers for parallel XML parsing (default: CPU count)')
