@@ -33,7 +33,7 @@ import xml.etree.ElementTree as ET
 import concurrent.futures
 import tempfile
 from datetime import datetime
-from pandas import DataFrame, read_csv
+from pandas import DataFrame, read_csv, to_datetime, to_numeric
 from pandas.core.groupby import DataFrameGroupBy
 import matplotlib.pyplot as plt
 import openai
@@ -627,15 +627,34 @@ def parse_health_data(file_path, record_type):
         pandas.DataFrame: DataFrame containing dates and values for the specified metric
     """
     print(f"Starting to parse {record_type}...")
+
+    # Prefer pre-generated records.csv to avoid re-scanning XML
+    records_csv = get_output_path('records.csv')
+    if not _cli_force_rescan and os.path.exists(records_csv):
+        try:
+            df = read_csv(records_csv)
+            if 'type' in df.columns:
+                df = df[df['type'] == record_type].copy()
+                if not df.empty:
+                    if 'endDate' in df.columns:
+                        df['date'] = to_datetime(df['endDate'], errors='coerce')
+                    df['value'] = to_numeric(df['value'], errors='coerce')
+                    df = df.dropna(subset=['date', 'value'])
+                    if not df.empty:
+                        print(f"Loaded {len(df)} rows for {record_type} from cached records.csv")
+                        return df[['date', 'value']]
+        except Exception:
+            pass
+
     dates = []
     values = []
-    
+    bad_samples = []
+
     tree = ET.parse(file_path)
     root = tree.getroot()
-    
+
     print("XML file loaded, searching records...")
-    
-    bad_samples = []
+
     for record in root.findall('.//Record'):
         if record.get('type') == record_type:
             try:
@@ -655,7 +674,7 @@ def parse_health_data(file_path, record_type):
                         'sourceName': record.get('sourceName')
                     })
                 continue
-    
+
     print(f"Found {len(dates)} records")
     # If we encountered parsing issues, persist a short debug note
     if bad_samples:
