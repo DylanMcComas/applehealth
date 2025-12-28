@@ -223,6 +223,7 @@ Notes:
 - By default, outputs are saved to `./health_out`.
 - `--out` lets you choose a different output folder.
 - Performance tuning for XML → CSV/JSON exports (menu options 7/8): `--workers N` sets the process pool size (default: CPU cores), `--batch-size N` controls streaming chunk size (default: 10000), and `--no-multiprocessing` forces single-process mode if you hit platform limits.
+- Caching: if `export.xml` is unchanged and outputs exist, menu options 7/8 reuse the previous CSV/JSON without re-scanning. Use `--force-rescan` to regenerate.
 
 ## 🐳 Docker Usage
 

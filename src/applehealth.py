@@ -64,6 +64,7 @@ _output_dir = os.environ.get('OUTPUT_DIR')
 _cli_worker_count: Optional[int] = None
 _cli_batch_size: Optional[int] = None
 _cli_disable_multiprocessing: bool = False
+_cli_force_rescan: bool = False
 __version__ = "1.4.3"
 
 def get_output_dir():
@@ -356,6 +357,45 @@ def _process_json_elements_batch(batch: List[Tuple[str, Dict[str, str], List[Tup
             result[tag]['bad'] += 1
 
     return result
+
+
+def _fingerprint_export(path: str) -> Optional[Dict[str, Any]]:
+    try:
+        st = os.stat(path)
+        return {
+            'path': os.path.abspath(path),
+            'mtime': int(st.st_mtime),
+            'size': int(st.st_size),
+        }
+    except Exception:
+        return None
+
+
+def _should_reuse_cached_outputs(pref_key: str, export_path: str, out_dir: str, expected_files: List[str], force: bool) -> bool:
+    if force:
+        return False
+
+    fp = _fingerprint_export(export_path)
+    saved = _get_saved_pref(pref_key)
+    if not fp or not isinstance(saved, dict):
+        return False
+
+    if (
+        saved.get('path') != fp['path']
+        or saved.get('mtime') != fp['mtime']
+        or saved.get('size') != fp['size']
+        or os.path.abspath(saved.get('output_dir', '')) != os.path.abspath(out_dir)
+    ):
+        return False
+
+    for f in expected_files:
+        if not os.path.exists(f):
+            return False
+
+    _status("export.xml unchanged; reusing existing outputs. Use --force-rescan to rebuild.")
+    for f in expected_files:
+        print(f"Cached: {f}")
+    return True
 
 
 def _resolve_worker_settings(worker_count: Optional[int], batch_size: Optional[int]) -> Tuple[int, int]:
@@ -2760,6 +2800,7 @@ def convert_xml_to_csv(
     worker_count: Optional[int] = None,
     batch_size: Optional[int] = None,
     use_multiprocessing: bool = True,
+    force_rescan: bool = False,
 ):
     """Convert Apple Health export.xml into comprehensive CSV files.
 
@@ -2772,15 +2813,32 @@ def convert_xml_to_csv(
     - Metadata entries are flattened as columns named 'metadata:<key>'.
     - Streaming parser and batch processing keep memory usage low and parallelize
       flattening when multiprocessing is available.
+    - If export.xml and output directory are unchanged, existing CSVs are reused
+      unless force_rescan is True or --force-rescan is passed.
     """
     export_path = resolve_export_xml()
     print(f"Using export file: {export_path}")
 
+    effective_force = force_rescan or _cli_force_rescan
     resolved_workers, resolved_batch = _resolve_worker_settings(worker_count, batch_size)
     use_pool = use_multiprocessing and not _cli_disable_multiprocessing and resolved_workers > 1
 
     out_dir = get_output_dir()
     os.makedirs(out_dir, exist_ok=True)
+
+    expected_outputs = {
+        'Record': os.path.join(out_dir, 'records.csv'),
+        'Workout': os.path.join(out_dir, 'workouts.csv'),
+        'ActivitySummary': os.path.join(out_dir, 'activity_summary.csv'),
+    }
+    if _should_reuse_cached_outputs(
+        pref_key='csv_export_cache',
+        export_path=export_path,
+        out_dir=out_dir,
+        expected_files=list(expected_outputs.values()),
+        force=effective_force,
+    ):
+        return
 
     preferred_cols = [
         'type', 'unit', 'value', 'sourceName', 'sourceVersion', 'device',
@@ -2972,11 +3030,16 @@ def convert_xml_to_csv(
     # Print quick-open tip for convenience
     if records_path:
         print_open_hint(records_path)
+    fp = _fingerprint_export(export_path)
+    if fp:
+        fp['output_dir'] = out_dir
+        _set_saved_pref('csv_export_cache', fp)
 
 def convert_xml_to_json(
     worker_count: Optional[int] = None,
     batch_size: Optional[int] = None,
     use_multiprocessing: bool = True,
+    force_rescan: bool = False,
 ):
     """Convert Apple Health export.xml into JSON files.
 
@@ -2990,10 +3053,13 @@ def convert_xml_to_json(
       MetadataEntry 'key' values and values are the corresponding 'value'.
     - Streaming parser and optional multiprocessing keep memory usage low by
       processing batches and writing JSON incrementally.
+    - If export.xml and output directory are unchanged, existing JSON files are
+      reused unless force_rescan is True or --force-rescan is passed.
     """
     export_path = resolve_export_xml()
     print(f"Using export file: {export_path}")
 
+    effective_force = force_rescan or _cli_force_rescan
     resolved_workers, resolved_batch = _resolve_worker_settings(worker_count, batch_size)
     use_pool = use_multiprocessing and not _cli_disable_multiprocessing and resolved_workers > 1
 
@@ -3008,6 +3074,14 @@ def convert_xml_to_json(
         'Workout': os.path.join(out_dir, 'workouts.json'),
         'ActivitySummary': os.path.join(out_dir, 'activity_summary.json'),
     }
+    if _should_reuse_cached_outputs(
+        pref_key='json_export_cache',
+        export_path=export_path,
+        out_dir=out_dir,
+        expected_files=list(paths.values()),
+        force=effective_force,
+    ):
+        return
 
     executor = None
     pending = []
@@ -3121,6 +3195,10 @@ def convert_xml_to_json(
         print(f"Saved: {w_path}")
     if as_path:
         print(f"Saved: {as_path}")
+    fp = _fingerprint_export(export_path)
+    if fp:
+        fp['output_dir'] = out_dir
+        _set_saved_pref('json_export_cache', fp)
 
 def main():
     """
@@ -3269,6 +3347,7 @@ if __name__ == "__main__":
         parser.add_argument('--workers', type=int, help='Number of workers for parallel XML parsing (default: CPU count)')
         parser.add_argument('--batch-size', type=int, help='Number of XML elements per processing batch (default: 10000)')
         parser.add_argument('--no-multiprocessing', action='store_true', help='Force single-threaded CSV conversion')
+        parser.add_argument('--force-rescan', action='store_true', help='Ignore cache and reprocess export.xml even if unchanged')
         parser.add_argument('path', nargs='?', help='Optional positional path to export.xml or containing directory')
         args = parser.parse_args()
         chosen = args.export or args.path
@@ -3290,6 +3369,8 @@ if __name__ == "__main__":
             _cli_batch_size = args.batch_size
         if args.no_multiprocessing:
             _cli_disable_multiprocessing = True
+        if args.force_rescan:
+            _cli_force_rescan = True
     except SystemExit:
         raise
 
