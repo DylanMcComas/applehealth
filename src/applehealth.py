@@ -1590,7 +1590,11 @@ def _generate_metric_csvs_from_records(records_path: str, needed: set):
                         duration_minutes = (ed - sd).total_seconds() / 60.0
                     except Exception:
                         continue
-                    val = row.get('value') or ''
+                    val = row.get('value')
+                    if pd.isna(val):
+                        val = ''
+                    else:
+                        val = str(val)
                     sleep_type = 'Unknown'
                     if 'InBed' in val:
                         sleep_type = 'In Bed'
