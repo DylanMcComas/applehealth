@@ -80,7 +80,17 @@ def get_output_dir():
     """
     global _output_dir
     default_out = os.path.join(os.getcwd(), 'health_out')
-    base = _output_dir or os.environ.get('OUTPUT_DIR') or _get_saved_pref('output_dir') or default_out
+    env_out = os.environ.get('OUTPUT_DIR')
+    base = _output_dir or env_out or _get_saved_pref('output_dir') or default_out
+    # Avoid silently writing to temp dirs when no explicit out was provided
+    def _is_temp_path(p: str) -> bool:
+        try:
+            tmp = tempfile.gettempdir()
+            return os.path.abspath(p).startswith(os.path.abspath(tmp))
+        except Exception:
+            return False
+    if not (_output_dir or env_out) and _is_temp_path(base):
+        base = default_out
     base = os.path.abspath(os.path.expanduser(base))
     try:
         os.makedirs(base, exist_ok=True)
@@ -1737,27 +1747,34 @@ def _generate_workout_csv_from_export(workouts_path: str):
 
 
 def _generate_ai_data(csv_files: List[Tuple[str, str]]) -> bool:
-    """Ensure AI options have needed CSVs using the streaming converter + cached exports."""
-    missing_files = []
-    for file_name, data_type in csv_files:
-        path = get_output_path(file_name)
-        if not os.path.exists(path) or os.path.getsize(path) == 0:
-            missing_files.append((file_name, data_type))
+    """Ensure AI options have needed CSVs using the streaming converter + cached exports.
 
-    if not missing_files:
-        return True
+    For AI runs we always write into a fresh timestamped output folder to avoid
+    overwriting prior exports and to keep runs isolated.
+    """
+    base_out = get_output_dir()
+    run_dir = os.path.join(base_out, datetime.now().strftime("run_%Y%m%d_%H%M%S"))
+    os.makedirs(run_dir, exist_ok=True)
 
-    print("\nSome required data files are missing. Using optimized streaming export to build them...")
-    print("This reuses the same chunked, parallel XML converter as menu options 7/8.")
+    # Point downstream helpers to the new run directory
+    global _output_dir
+    _output_dir = run_dir
+    try:
+        _set_saved_pref('output_dir', run_dir)
+    except Exception:
+        pass
+
+    print(f"\nGenerating fresh exports for AI analysis in: {run_dir}")
+    print("This uses the chunked, parallel XML converter (same as options 7/8) and keeps previous runs untouched.")
 
     try:
-        convert_xml_to_csv()
+        convert_xml_to_csv(out_dir_override=run_dir)
     except Exception as e:
         _status(f"Optimized XML → CSV export failed ({e}); trying legacy analyzers.")
-        return _legacy_generate_missing_analysis_files(missing_files)
+        return _legacy_generate_missing_analysis_files(csv_files)
 
-    needed_names = {name for name, _ in missing_files}
-    records_needed = needed_names & {
+    needed_names = {name for name, _ in csv_files}
+    records_needed = {
         'steps_data.csv',
         'distance_data.csv',
         'heart_rate_data.csv',
@@ -1767,16 +1784,16 @@ def _generate_ai_data(csv_files: List[Tuple[str, str]]) -> bool:
     workouts_needed = 'workout_data.csv' in needed_names
 
     ok = True
-    records_path = get_output_path('records.csv')
-    if records_needed:
+    records_path = os.path.join(run_dir, 'records.csv')
+    if records_needed & needed_names:
         if os.path.exists(records_path):
-            _generate_metric_csvs_from_records(records_path, records_needed)
+            _generate_metric_csvs_from_records(records_path, records_needed & needed_names)
         else:
             _status("records.csv missing after conversion; skipping optimized metric builds.")
             ok = False
 
     if workouts_needed:
-        workouts_path = get_output_path('workouts.csv')
+        workouts_path = os.path.join(run_dir, 'workouts.csv')
         if os.path.exists(workouts_path):
             _generate_workout_csv_from_export(workouts_path)
         else:
@@ -1785,8 +1802,8 @@ def _generate_ai_data(csv_files: List[Tuple[str, str]]) -> bool:
 
     # Verify generation; fallback to legacy if anything is still missing
     remaining = []
-    for name, dt in missing_files:
-        path = get_output_path(name)
+    for name, dt in csv_files:
+        path = os.path.join(run_dir, name)
         if not os.path.exists(path) or os.path.getsize(path) == 0:
             remaining.append((name, dt))
     if remaining:
@@ -3025,6 +3042,7 @@ def convert_xml_to_csv(
     batch_size: Optional[int] = None,
     use_multiprocessing: bool = True,
     force_rescan: bool = False,
+    out_dir_override: Optional[str] = None,
 ):
     """Convert Apple Health export.xml into comprehensive CSV files.
 
@@ -3047,7 +3065,7 @@ def convert_xml_to_csv(
     resolved_workers, resolved_batch = _resolve_worker_settings(worker_count, batch_size)
     use_pool = use_multiprocessing and not _cli_disable_multiprocessing and resolved_workers > 1
 
-    out_dir = get_output_dir()
+    out_dir = os.path.abspath(out_dir_override) if out_dir_override else get_output_dir()
     os.makedirs(out_dir, exist_ok=True)
 
     expected_outputs = {
