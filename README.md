@@ -224,6 +224,7 @@ Notes:
 - `--out` lets you choose a different output folder.
 - Performance tuning for XML → CSV/JSON exports (menu options 7/8): `--workers N` sets the process pool size (default: CPU cores), `--batch-size N` controls streaming chunk size (default: 10000), and `--no-multiprocessing` forces single-process mode if you hit platform limits.
 - Caching: if `export.xml` is unchanged and outputs exist, menu options 7/8 reuse the previous CSV/JSON without re-scanning. Use `--force-rescan` to regenerate.
+- AI options (9–18) reuse the same streaming, chunked XML → CSV/JSON converter; `--workers`, `--batch-size`, `--no-multiprocessing`, and `--force-rescan` apply there too when exports are triggered automatically.
 
 ## 🐳 Docker Usage
 
@@ -291,7 +292,7 @@ Choose from the menu:
 
 ### 🤖 AI Analysis
 
-The new AI analysis feature (Option 7) will:
+The AI analysis options (9–18) will:
 
 - Analyze all your exported health data
 - Provide personalized insights using ChatGPT
@@ -300,7 +301,7 @@ The new AI analysis feature (Option 7) will:
 - Highlight unusual findings
 
 Notes:
-- If you haven’t run any analysis yet, the AI options will trigger the necessary data exports automatically.
+- If you haven’t run any analysis yet, the AI options will trigger the necessary data exports automatically using the same parallel, chunked XML → CSV/JSON pipeline as options 7/8 (tune with `--workers`, `--batch-size`, `--no-multiprocessing`, `--force-rescan`).
 - API keys can be provided via `.env` or pasted when prompted in the terminal:
   - ChatGPT (OpenAI): `OPENAI_API_KEY`
   - Claude (Anthropic): `ANTHROPIC_API_KEY`
@@ -311,7 +312,7 @@ Notes:
 
 ### 🖥️ Local LLM Analysis
 
-The local analysis feature (Option 8) will:
+The local analysis options (14, 16–18) will:
 
 - Process data entirely on your machine
 - Use Ollama with Deepseek-R1 by default
@@ -362,7 +363,7 @@ Environment variables (optional):
 
 ### 🌐 External LLM Analysis
 
-The external LLM analysis feature (Option 9) will:
+The external LLM analysis feature (Option 15) will:
 
 - Connect to a remote Ollama instance
 - Default to a preconfigured remote server

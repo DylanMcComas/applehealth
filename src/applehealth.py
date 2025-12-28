@@ -35,6 +35,7 @@ import tempfile
 from datetime import datetime
 from pandas import DataFrame, read_csv, to_datetime, to_numeric
 from pandas.core.groupby import DataFrameGroupBy
+import pandas as pd
 import matplotlib.pyplot as plt
 import openai
 import os
@@ -49,6 +50,7 @@ import json
 from urllib.parse import unquote as _url_unquote
 from typing import Optional, List, Dict, Any, Tuple
 import re
+from collections import defaultdict
 try:
     import anthropic  # Claude SDK
 except Exception:
@@ -1449,6 +1451,349 @@ def analyze_workouts():
         if workout['distance_km'] > 0:
             print(f"Distance: {workout['distance_km']:.1f} km")
 
+
+def _legacy_generate_missing_analysis_files(missing_files: List[Tuple[str, str]]) -> bool:
+    """Fall back to the original per-metric analyzers (non-streaming) if needed."""
+    if not missing_files:
+        return True
+
+    print("Falling back to per-metric analyzers to generate missing CSVs...")
+    original_show = plt.show
+    plt.show = lambda: None
+    success = True
+    try:
+        analysis_functions = {
+            'steps_data.csv': analyze_steps,
+            'distance_data.csv': analyze_distance,
+            'heart_rate_data.csv': analyze_heart_rate,
+            'weight_data.csv': analyze_weight,
+            'sleep_data.csv': analyze_sleep,
+            'workout_data.csv': analyze_workouts,
+        }
+
+        for file_name, data_type in missing_files:
+            func = analysis_functions.get(file_name)
+            if not func:
+                continue
+            print(f"\nGenerating {file_name} from {data_type} data (legacy path)...")
+            try:
+                func()
+            except Exception as e:
+                _status(f"Legacy generation failed for {file_name}: {e}")
+            gen_path = get_output_path(file_name)
+            if not os.path.exists(gen_path):
+                _status(f"Failed to generate {gen_path}")
+                success = False
+            else:
+                _status(f"✓ Generated {gen_path}")
+    finally:
+        plt.show = original_show
+    return success
+
+
+def _generate_metric_csvs_from_records(records_path: str, needed: set):
+    """Create per-metric CSVs used by AI options from records.csv without re-parsing XML."""
+    if not needed:
+        return
+
+    chunk_size = max(_cli_batch_size or 10000, 50000)
+    type_map = {
+        'steps_data.csv': 'HKQuantityTypeIdentifierStepCount',
+        'distance_data.csv': 'HKQuantityTypeIdentifierDistanceWalkingRunning',
+        'heart_rate_data.csv': 'HKQuantityTypeIdentifierHeartRate',
+        'weight_data.csv': 'HKQuantityTypeIdentifierBodyMass',
+        'sleep_data.csv': 'HKCategoryTypeIdentifierSleepAnalysis',
+    }
+    needed_types = {v for k, v in type_map.items() if k in needed}
+    if not needed_types:
+        return
+
+    step_totals = defaultdict(float)
+    distance_totals = defaultdict(float)
+    hr_sums = defaultdict(float)
+    hr_counts = defaultdict(int)
+    weight_latest: Dict[Any, Tuple[Any, float]] = {}
+    sleep_rows: List[Dict[str, Any]] = []
+
+    usecols = ['type', 'value', 'unit', 'sourceName', 'startDate', 'endDate']
+    try:
+        chunk_iter = read_csv(records_path, usecols=usecols, dtype=str, chunksize=chunk_size)
+    except Exception:
+        chunk_iter = [read_csv(records_path, dtype=str)]
+
+    _status(f"Building metric CSVs from {records_path} with chunk size {chunk_size}...")
+    for chunk in chunk_iter:
+        if chunk.empty:
+            continue
+        chunk = chunk[chunk['type'].isin(needed_types)]
+        if chunk.empty:
+            continue
+
+        if 'endDate' in chunk.columns:
+            chunk['endDate'] = to_datetime(chunk['endDate'], errors='coerce')
+        if 'startDate' in chunk.columns and 'sleep_data.csv' in needed:
+            chunk['startDate'] = to_datetime(chunk['startDate'], errors='coerce')
+
+        if 'value' in chunk.columns:
+            chunk['value'] = to_numeric(chunk['value'], errors='coerce')
+
+        if 'steps_data.csv' in needed:
+            steps = chunk[chunk['type'] == type_map['steps_data.csv']].dropna(subset=['endDate', 'value'])
+            if not steps.empty:
+                steps['date'] = steps['endDate'].dt.date
+                for dt, val in steps.groupby('date')['value'].sum().items():
+                    step_totals[dt] += float(val)
+
+        if 'distance_data.csv' in needed:
+            dist = chunk[chunk['type'] == type_map['distance_data.csv']].dropna(subset=['endDate', 'value'])
+            if not dist.empty:
+                dist['date'] = dist['endDate'].dt.date
+                for dt, val in dist.groupby('date')['value'].sum().items():
+                    distance_totals[dt] += float(val)
+
+        if 'heart_rate_data.csv' in needed:
+            hr = chunk[chunk['type'] == type_map['heart_rate_data.csv']].dropna(subset=['endDate', 'value'])
+            if not hr.empty:
+                hr['date'] = hr['endDate'].dt.date
+                grouped = hr.groupby('date')['value'].agg(['sum', 'count'])
+                for dt, row in grouped.iterrows():
+                    hr_sums[dt] += float(row['sum'])
+                    hr_counts[dt] += int(row['count'])
+
+        if 'weight_data.csv' in needed:
+            wt = chunk[chunk['type'] == type_map['weight_data.csv']].dropna(subset=['endDate', 'value'])
+            if not wt.empty:
+                for ts, dt, val in zip(wt['endDate'], wt['endDate'].dt.date, wt['value']):
+                    prev = weight_latest.get(dt)
+                    if prev is None or ts >= prev[0]:
+                        weight_latest[dt] = (ts, float(val))
+
+        if 'sleep_data.csv' in needed:
+            sleep_df = chunk[chunk['type'] == type_map['sleep_data.csv']].dropna(subset=['startDate', 'endDate'])
+            if not sleep_df.empty:
+                for _, row in sleep_df.iterrows():
+                    sd = row.get('startDate')
+                    ed = row.get('endDate')
+                    if sd is None or ed is None:
+                        continue
+                    try:
+                        duration_minutes = (ed - sd).total_seconds() / 60.0
+                    except Exception:
+                        continue
+                    val = row.get('value') or ''
+                    sleep_type = 'Unknown'
+                    if 'InBed' in val:
+                        sleep_type = 'In Bed'
+                    elif 'AsleepUnspecified' in val:
+                        sleep_type = 'Asleep'
+                    elif 'AsleepREM' in val:
+                        sleep_type = 'REM Sleep'
+                    elif 'AsleepCore' in val:
+                        sleep_type = 'Core Sleep'
+                    elif 'AsleepDeep' in val:
+                        sleep_type = 'Deep Sleep'
+                    elif 'Awake' in val:
+                        sleep_type = 'Awake'
+
+                    try:
+                        sleep_rows.append({
+                            'date': sd.date(),
+                            'start_time': sd.time(),
+                            'end_time': ed.time(),
+                            'duration_minutes': round(duration_minutes, 1),
+                            'duration_hours': round(duration_minutes / 60.0, 2),
+                            'sleep_type': sleep_type,
+                            'sleep_value': val,
+                            'source': row.get('sourceName') or 'Unknown',
+                        })
+                    except Exception:
+                        continue
+
+    if 'steps_data.csv' in needed:
+        series = DataFrame.from_dict(step_totals, orient='index', columns=['value']).sort_index()
+        series.index.name = 'date'
+        series.to_csv(get_output_path('steps_data.csv'))
+
+    if 'distance_data.csv' in needed:
+        series = DataFrame.from_dict(distance_totals, orient='index', columns=['value']).sort_index()
+        series.index.name = 'date'
+        series.to_csv(get_output_path('distance_data.csv'))
+
+    if 'heart_rate_data.csv' in needed:
+        hr_avg = {dt: hr_sums[dt] / hr_counts[dt] for dt in hr_sums if hr_counts[dt]}
+        series = DataFrame.from_dict(hr_avg, orient='index', columns=['value']).sort_index()
+        series.index.name = 'date'
+        series.to_csv(get_output_path('heart_rate_data.csv'))
+
+    if 'weight_data.csv' in needed:
+        weights = {dt: val for dt, (ts, val) in weight_latest.items()}
+        series = DataFrame.from_dict(weights, orient='index', columns=['value']).sort_index()
+        series.index.name = 'date'
+        series.to_csv(get_output_path('weight_data.csv'))
+
+    if 'sleep_data.csv' in needed:
+        cols = ['date', 'start_time', 'end_time', 'duration_minutes', 'duration_hours', 'sleep_type', 'sleep_value', 'source']
+        sleep_df = DataFrame(sleep_rows, columns=cols)
+        if 'date' in sleep_df:
+            sleep_df['date'] = sleep_df['date'].astype(str)
+        sleep_df.to_csv(get_output_path('sleep_data.csv'), index=False)
+
+
+def _generate_workout_csv_from_export(workouts_path: str):
+    """Create workout_data.csv from workouts.csv produced by the streaming converter."""
+    chunk_size = max(_cli_batch_size or 10000, 50000)
+    usecols = [
+        'workoutActivityType',
+        'duration',
+        'durationUnit',
+        'totalDistance',
+        'totalDistanceUnit',
+        'totalEnergyBurned',
+        'totalEnergyBurnedUnit',
+        'startDate',
+        'endDate',
+        'sourceName',
+    ]
+    try:
+        chunk_iter = read_csv(workouts_path, usecols=usecols, dtype=str, chunksize=chunk_size)
+    except Exception:
+        chunk_iter = [read_csv(workouts_path, dtype=str)]
+
+    rows = []
+    _status(f"Building workout_data.csv from {workouts_path} with chunk size {chunk_size}...")
+    for chunk in chunk_iter:
+        if chunk.empty:
+            continue
+        chunk['startDate'] = to_datetime(chunk.get('startDate'), errors='coerce')
+        chunk['endDate'] = to_datetime(chunk.get('endDate'), errors='coerce')
+        chunk['duration'] = to_numeric(chunk.get('duration'), errors='coerce')
+        chunk['totalDistance'] = to_numeric(chunk.get('totalDistance'), errors='coerce')
+        chunk['totalEnergyBurned'] = to_numeric(chunk.get('totalEnergyBurned'), errors='coerce')
+
+        for _, row in chunk.iterrows():
+            start = row.get('startDate')
+            end = row.get('endDate')
+            if start is None or (isinstance(start, float) and pd.isna(start)):
+                continue
+
+            duration_minutes = None
+            dur_val = row.get('duration')
+            if dur_val is not None and not pd.isna(dur_val):
+                unit = row.get('durationUnit') or 'min'
+                try:
+                    duration_minutes = float(dur_val)
+                    if unit == 'sec':
+                        duration_minutes = duration_minutes / 60.0
+                    elif unit == 'h':
+                        duration_minutes = duration_minutes * 60.0
+                except Exception:
+                    duration_minutes = None
+            if duration_minutes is None and end is not None and not pd.isna(end):
+                try:
+                    duration_minutes = (end - start).total_seconds() / 60.0
+                except Exception:
+                    duration_minutes = None
+            if duration_minutes is None:
+                duration_minutes = 0.0
+
+            calories = row.get('totalEnergyBurned')
+            try:
+                calories_val = float(calories) if calories is not None and not pd.isna(calories) else 0.0
+            except Exception:
+                calories_val = 0.0
+
+            distance = row.get('totalDistance')
+            try:
+                distance_val = float(distance) if distance is not None and not pd.isna(distance) else 0.0
+            except Exception:
+                distance_val = 0.0
+            unit = row.get('totalDistanceUnit') or ''
+            if unit == 'm':
+                distance_val = distance_val / 1000.0
+
+            activity = row.get('workoutActivityType') or 'Unknown'
+            if isinstance(activity, str) and activity.startswith('HKWorkoutActivityType'):
+                activity = activity.replace('HKWorkoutActivityType', '')
+
+            try:
+                rows.append({
+                    'date': start.date(),
+                    'start_time': start.time(),
+                    'activity_type': activity,
+                    'duration_minutes': round(duration_minutes, 1),
+                    'duration_hours': round(duration_minutes / 60.0, 2),
+                    'calories': round(calories_val, 1),
+                    'distance_km': round(distance_val, 2),
+                    'source': row.get('sourceName') or 'Unknown',
+                })
+            except Exception:
+                continue
+
+    cols = ['date', 'start_time', 'activity_type', 'duration_minutes', 'duration_hours', 'calories', 'distance_km', 'source']
+    df = DataFrame(rows, columns=cols)
+    if 'date' in df:
+        df['date'] = df['date'].astype(str)
+    df.to_csv(get_output_path('workout_data.csv'), index=False)
+
+
+def _generate_ai_data(csv_files: List[Tuple[str, str]]) -> bool:
+    """Ensure AI options have needed CSVs using the streaming converter + cached exports."""
+    missing_files = []
+    for file_name, data_type in csv_files:
+        path = get_output_path(file_name)
+        if not os.path.exists(path) or os.path.getsize(path) == 0:
+            missing_files.append((file_name, data_type))
+
+    if not missing_files:
+        return True
+
+    print("\nSome required data files are missing. Using optimized streaming export to build them...")
+    print("This reuses the same chunked, parallel XML converter as menu options 7/8.")
+
+    try:
+        convert_xml_to_csv()
+    except Exception as e:
+        _status(f"Optimized XML → CSV export failed ({e}); trying legacy analyzers.")
+        return _legacy_generate_missing_analysis_files(missing_files)
+
+    needed_names = {name for name, _ in missing_files}
+    records_needed = needed_names & {
+        'steps_data.csv',
+        'distance_data.csv',
+        'heart_rate_data.csv',
+        'weight_data.csv',
+        'sleep_data.csv',
+    }
+    workouts_needed = 'workout_data.csv' in needed_names
+
+    ok = True
+    records_path = get_output_path('records.csv')
+    if records_needed:
+        if os.path.exists(records_path):
+            _generate_metric_csvs_from_records(records_path, records_needed)
+        else:
+            _status("records.csv missing after conversion; skipping optimized metric builds.")
+            ok = False
+
+    if workouts_needed:
+        workouts_path = get_output_path('workouts.csv')
+        if os.path.exists(workouts_path):
+            _generate_workout_csv_from_export(workouts_path)
+        else:
+            _status("workouts.csv missing after conversion; skipping optimized workout CSV build.")
+            ok = False
+
+    # Verify generation; fallback to legacy if anything is still missing
+    remaining = []
+    for name, dt in missing_files:
+        path = get_output_path(name)
+        if not os.path.exists(path) or os.path.getsize(path) == 0:
+            remaining.append((name, dt))
+    if remaining:
+        _status("Optimized generation incomplete; falling back to legacy analyzers for remaining files.")
+        ok = _legacy_generate_missing_analysis_files(remaining)
+    return ok
+
 def analyze_with_chatgpt(csv_files):
     """
     Analyze health data using OpenAI's ChatGPT.
@@ -1469,47 +1814,8 @@ def analyze_with_chatgpt(csv_files):
         os.environ['OPENAI_API_KEY'] = api_key
     openai.api_key = api_key
     
-    # Check if required data files exist and run analyses if needed
-    missing_files = []
-    for file_name, data_type in csv_files:
-        path = get_output_path(file_name)
-        if not os.path.exists(path):
-            missing_files.append((file_name, data_type))
-    
-    if missing_files:
-        print("\nSome required data files are missing. Running analyses to generate them...")
-        print("Note: This will generate all required data files without displaying plots.")
-        print("You can view the plots later by running options 1-6 individually.")
-        
-        # Temporarily disable plot display to avoid blocking
-        original_show = plt.show
-        plt.show = lambda: None  # Replace with no-op function
-        
-        try:
-            # Map file names to their corresponding analysis functions
-            analysis_functions = {
-                'steps_data.csv': analyze_steps,
-                'distance_data.csv': analyze_distance,
-                'heart_rate_data.csv': analyze_heart_rate,
-                'weight_data.csv': analyze_weight,
-                'sleep_data.csv': analyze_sleep,
-                'workout_data.csv': analyze_workouts
-            }
-            
-            # Run the necessary analyses
-            for file_name, data_type in missing_files:
-                if file_name in analysis_functions:
-                    print(f"\nGenerating {file_name} from {data_type} data...")
-                    analysis_functions[file_name]()
-                    # Verify the file was created
-                    gen_path = get_output_path(file_name)
-                    if os.path.exists(gen_path):
-                        print(f"✓ Successfully generated {gen_path}")
-                    else:
-                        print(f"✗ Failed to generate {gen_path}")
-        finally:
-            # Restore original plt.show function
-            plt.show = original_show
+    if not _generate_ai_data(csv_files):
+        return
     
     # Add data preparation code
     data_summary = {}
@@ -1635,47 +1941,8 @@ def analyze_with_ollama(csv_files):
         csv_files: List of CSV files to analyze
     """
     try:
-        # Check if required data files exist and run analyses if needed
-        missing_files = []
-        for file_name, data_type in csv_files:
-            path = get_output_path(file_name)
-            if not os.path.exists(path):
-                missing_files.append((file_name, data_type))
-        
-        if missing_files:
-            print("\nSome required data files are missing. Running analyses to generate them...")
-            print("Note: This will generate all required data files without displaying plots.")
-            print("You can view the plots later by running options 1-6 individually.")
-            
-            # Temporarily disable plot display to avoid blocking
-            original_show = plt.show
-            plt.show = lambda: None  # Replace with no-op function
-            
-            try:
-                # Map file names to their corresponding analysis functions
-                analysis_functions = {
-                    'steps_data.csv': analyze_steps,
-                    'distance_data.csv': analyze_distance,
-                    'heart_rate_data.csv': analyze_heart_rate,
-                    'weight_data.csv': analyze_weight,
-                    'sleep_data.csv': analyze_sleep,
-                    'workout_data.csv': analyze_workouts
-                }
-                
-                # Run the necessary analyses
-                for file_name, data_type in missing_files:
-                    if file_name in analysis_functions:
-                        print(f"\nGenerating {file_name} from {data_type} data...")
-                        analysis_functions[file_name]()
-                        # Verify the file was created
-                        gen_path = get_output_path(file_name)
-                        if os.path.exists(gen_path):
-                            print(f"✓ Successfully generated {gen_path}")
-                        else:
-                            print(f"✗ Failed to generate {gen_path}")
-            finally:
-                # Restore original plt.show function
-                plt.show = original_show
+        if not _generate_ai_data(csv_files):
+            return
         
         # Add data preparation code
         data_summary = {}
@@ -1827,48 +2094,8 @@ def analyze_with_external_ollama(csv_files):
             if custom_host:
                 ollama_host = custom_host
                 print(f"Using custom Ollama host: {ollama_host}")
-        
-        # Check if required data files exist and run analyses if needed
-        missing_files = []
-        for file_name, data_type in csv_files:
-            path = get_output_path(file_name)
-            if not os.path.exists(path):
-                missing_files.append((file_name, data_type))
-        
-        if missing_files:
-            print("\nSome required data files are missing. Running analyses to generate them...")
-            print("Note: This will generate all required data files without displaying plots.")
-            print("You can view the plots later by running options 1-6 individually.")
-            
-            # Temporarily disable plot display to avoid blocking
-            original_show = plt.show
-            plt.show = lambda: None  # Replace with no-op function
-            
-            try:
-                # Map file names to their corresponding analysis functions
-                analysis_functions = {
-                    'steps_data.csv': analyze_steps,
-                    'distance_data.csv': analyze_distance,
-                    'heart_rate_data.csv': analyze_heart_rate,
-                    'weight_data.csv': analyze_weight,
-                    'sleep_data.csv': analyze_sleep,
-                    'workout_data.csv': analyze_workouts
-                }
-                
-                # Run the necessary analyses
-                for file_name, data_type in missing_files:
-                    if file_name in analysis_functions:
-                        print(f"\nGenerating {file_name} from {data_type} data...")
-                        analysis_functions[file_name]()
-                        # Verify the file was created
-                        gen_path = get_output_path(file_name)
-                        if os.path.exists(gen_path):
-                            print(f"✓ Successfully generated {gen_path}")
-                        else:
-                            print(f"✗ Failed to generate {gen_path}")
-            finally:
-                # Restore original plt.show function
-                plt.show = original_show
+        if not _generate_ai_data(csv_files):
+            return
         
         # Add data preparation code
         data_summary = {}
@@ -2125,30 +2352,8 @@ def _get_or_prompt_key(env_name: str, label: str) -> str:
 
 def _prepare_ai_data(csv_files):
     """Generate missing CSVs if needed and build a shared prompt."""
-    missing_files = []
-    for file_name, data_type in csv_files:
-        if not os.path.exists(get_output_path(file_name)):
-            missing_files.append((file_name, data_type))
-
-    if missing_files:
-        print("\nSome required data files are missing. Running analyses to generate them...")
-        original_show = plt.show
-        plt.show = lambda: None
-        try:
-            analysis_functions = {
-                'steps_data.csv': analyze_steps,
-                'distance_data.csv': analyze_distance,
-                'heart_rate_data.csv': analyze_heart_rate,
-                'weight_data.csv': analyze_weight,
-                'sleep_data.csv': analyze_sleep,
-                'workout_data.csv': analyze_workouts
-            }
-            for file_name, data_type in missing_files:
-                if file_name in analysis_functions:
-                    print(f"Generating {file_name} from {data_type} data...")
-                    analysis_functions[file_name]()
-        finally:
-            plt.show = original_show
+    if not _generate_ai_data(csv_files):
+        return None, None
 
     data_summary = {}
     files_found = False
